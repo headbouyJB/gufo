@@ -69,9 +69,6 @@ struct OutputBudget {
 
 struct ScheduledRequest;
 
-/// Longest admission wait for a disk job writing a deeper prompt prefix.
-constexpr auto kPublicationWait = std::chrono::seconds(120);
-
 /// Requests holding each execution session, for `/slots`. No other mutex is
 /// acquired while this table's mutex is held.
 struct SessionTable {
@@ -143,6 +140,11 @@ struct ScheduledRequest {
   std::optional<TextGenerationScheduler::Clock::time_point>
       publication_wait_start;
   bool publication_waiting{false};
+  // Tokens a deeper pending prefix would save, and how long the wait may last.
+  // Fixed when the request parks: the rate moves little within a wait, and a
+  // bound that kept shrinking or growing would make the release unpredictable.
+  std::size_t publication_wait_tokens{0};
+  std::chrono::milliseconds publication_wait_limit{kPublicationWait};
   // The held `/slots` session while counted_processing is set. Only the
   // scheduler worker changes it.
   std::size_t session{kNoSession};
@@ -1033,12 +1035,39 @@ struct TextGenerationScheduler::Impl {
         }
         request->prefix_leader.reset();
       }
-      if (request->publication_waiting &&
-          (Clock::now() - *request->publication_wait_start > kPublicationWait ||
-           !runner_pool->PublicationPending(request->prompt,
-                                            request->prompt_context.get())))
-        request->publication_waiting = false;
+      if (request->publication_waiting) {
+        const auto waited =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                Clock::now() - *request->publication_wait_start);
+        const auto release = PublicationReleaseFor(
+            runner_pool->PublicationPending(request->prompt,
+                                            request->prompt_context.get()),
+            waited, request->publication_wait_limit);
+        if (release != PublicationRelease::kWaiting) {
+          request->publication_waiting = false;
+          LogPublicationRelease(*request, release, waited);
+        }
+      }
       ++it;
+    }
+  }
+
+  static void LogPublicationRelease(const ScheduledRequest& request,
+                                    PublicationRelease release,
+                                    std::chrono::milliseconds waited) noexcept {
+    if (!Logger::Enabled(LogLevel::kInfo))
+      return;
+    try {
+      const char* name = release == PublicationRelease::kPublished ? "published"
+                         : release == PublicationRelease::kBound   ? "bound"
+                                                                   : "cap";
+      std::ostringstream line;
+      line << "event=publication_wait id=" << request.id
+           << " tokens=" << request.publication_wait_tokens
+           << " limit_ms=" << request.publication_wait_limit.count()
+           << " wait_ms=" << waited.count() << " release=" << name;
+      Logger::Info("cache", line.str());
+    } catch (...) {
     }
   }
 
@@ -1090,13 +1119,18 @@ struct TextGenerationScheduler::Impl {
           waiting.push_back(std::move(request));
           continue;
         }
-        if (request->cache_prompt && !request->publication_wait_start &&
-            runner_pool->PublicationPending(request->prompt,
-                                            request->prompt_context.get())) {
-          request->publication_wait_start = Clock::now();
-          request->publication_waiting = true;
-          waiting.push_back(std::move(request));
-          continue;
+        if (request->cache_prompt && !request->publication_wait_start) {
+          const std::size_t gain = runner_pool->PublicationPending(
+              request->prompt, request->prompt_context.get());
+          if (gain > 0) {
+            request->publication_wait_start = Clock::now();
+            request->publication_waiting = true;
+            request->publication_wait_tokens = gain;
+            request->publication_wait_limit = PublicationWaitLimit(
+                gain, observed_prefill_tokens, observed_prefill_ms);
+            waiting.push_back(std::move(request));
+            continue;
+          }
         }
 
         const std::weak_ptr<ScheduledRequest> weak_request = request;
@@ -1199,6 +1233,8 @@ struct TextGenerationScheduler::Impl {
               .count();
       request->result.prefill_ms += step_ms;
       request->result.prefill_tokens += step.consumed_tokens;
+      observed_prefill_ms += step_ms;
+      observed_prefill_tokens += step.consumed_tokens;
       request->live_prefill_tokens.store(request->result.prefill_tokens,
                                          std::memory_order_relaxed);
       detail::TotalPromptTokens().fetch_add(step.consumed_tokens,
@@ -1987,6 +2023,10 @@ struct TextGenerationScheduler::Impl {
   std::vector<std::shared_ptr<ScheduledRequest>> device_lost_requests;
   std::size_t consecutive_active_prefill_chunks{0};
   std::uint64_t last_prefill_request_id{0};
+  // Prefill work the scheduler thread has timed so far; its rate bounds how
+  // long a request waits for a disk job instead of prefilling again.
+  std::size_t observed_prefill_tokens{0};
+  double observed_prefill_ms{0.0};
   std::atomic<std::uint64_t> next_request_id{1};
   // Written by the scheduler thread and read by the stall monitor. `progress`
   // advances when a request is admitted, a work unit starts, a pending

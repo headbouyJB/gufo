@@ -1148,7 +1148,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
   }
 }
 
-bool ComponentTextCache::PublicationPending(
+std::size_t ComponentTextCache::PublicationPending(
     std::span<const ContinuationToken> prompt,
     const TextPromptContext* context) const {
   // A disk job still writing a much deeper prefix of this prompt usually
@@ -1156,21 +1156,24 @@ bool ComponentTextCache::PublicationPending(
   // a conversation larger than the RAM budget has no RAM copy.
   constexpr std::size_t kWaitGainTokens = 4096;
   if (!impl_->queue)
-    return false;
+    return 0;
   const auto input = Inputs(prompt.size(), context);
   const std::lock_guard lock(impl_->mutex);
   const auto found =
       impl_->index.Lookup({impl_->identity, prompt, input, 0, true});
   const std::size_t best = found.selected ? found.selected->boundary : 0;
-  return std::ranges::any_of(impl_->pending_durable, [&](const auto& capture) {
+  std::size_t gain = 0;
+  for (const auto& capture : impl_->pending_durable) {
     if (!capture)
-      return false;
+      continue;
     const auto& tokens = capture->manifest.tokens;
-    return tokens.size() > best + kWaitGainTokens &&
-           tokens.size() <= prompt.size() &&
-           capture->manifest.input == At(input, tokens.size()) &&
-           std::equal(tokens.begin(), tokens.end(), prompt.begin());
-  });
+    if (tokens.size() > best + kWaitGainTokens &&
+        tokens.size() <= prompt.size() &&
+        capture->manifest.input == At(input, tokens.size()) &&
+        std::equal(tokens.begin(), tokens.end(), prompt.begin()))
+      gain = std::max(gain, tokens.size() - best);
+  }
+  return gain;
 }
 
 std::size_t ComponentTextCache::CachedPrefixTokens(

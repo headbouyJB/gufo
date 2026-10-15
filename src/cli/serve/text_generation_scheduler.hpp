@@ -57,6 +57,44 @@ struct TextSchedulerPolicy {
   bool log_progress{false};
 };
 
+/// Longest admission wait for a disk job writing a deeper prompt prefix.
+inline constexpr std::chrono::milliseconds kPublicationWait{
+    std::chrono::seconds(120)};
+/// Prefill that must be observed before its rate may shorten that wait.
+inline constexpr std::size_t kPublicationRateMinTokens = 4096;
+
+/// How long a request may wait for gain_tokens of prefix to be published: the
+/// time to prefill them again at the observed rate, at most kPublicationWait.
+/// The full wait applies until kPublicationRateMinTokens have been observed.
+[[nodiscard]] inline std::chrono::milliseconds PublicationWaitLimit(
+    std::size_t gain_tokens, std::size_t prefill_tokens, double prefill_ms) {
+  if (prefill_tokens < kPublicationRateMinTokens || !(prefill_ms > 0.0))
+    return kPublicationWait;
+  const double recompute_ms = static_cast<double>(gain_tokens) * prefill_ms /
+                              static_cast<double>(prefill_tokens);
+  if (!(recompute_ms < static_cast<double>(kPublicationWait.count())))
+    return kPublicationWait;
+  return std::chrono::milliseconds(static_cast<std::int64_t>(recompute_ms));
+}
+
+enum class PublicationRelease : std::uint8_t {
+  kWaiting,
+  kPublished,  // nothing deeper is pending any more
+  kBound,      // waited as long as recomputing would take
+  kCap,        // waited kPublicationWait with no rate to bound it
+};
+
+[[nodiscard]] inline PublicationRelease PublicationReleaseFor(
+    std::size_t pending_gain_tokens, std::chrono::milliseconds waited,
+    std::chrono::milliseconds limit) {
+  if (pending_gain_tokens == 0)
+    return PublicationRelease::kPublished;
+  if (waited <= limit)
+    return PublicationRelease::kWaiting;
+  return limit < kPublicationWait ? PublicationRelease::kBound
+                                  : PublicationRelease::kCap;
+}
+
 /// Single-owner scheduler for opaque text-model runner states.
 ///
 /// Submitters never execute model code. One scheduler thread owns admission,

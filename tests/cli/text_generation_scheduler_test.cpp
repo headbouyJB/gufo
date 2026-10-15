@@ -818,6 +818,42 @@ void TestAwaitedCheckpointSurvivesCachePressure() {
          "a checkpoint peers wait for is retained under cache pressure");
 }
 
+void TestPublicationWaitIsBoundedByRecomputeTime() {
+  using gufo::server::kPublicationRateMinTokens;
+  using gufo::server::kPublicationWait;
+  using gufo::server::PublicationRelease;
+  using gufo::server::PublicationReleaseFor;
+  using gufo::server::PublicationWaitLimit;
+  using std::chrono::milliseconds;
+
+  // 4,000 tokens/s observed: 16,384 tokens take 4,096 ms to prefill again.
+  const auto bound = PublicationWaitLimit(16384, 8192, 2048.0);
+  Expect(bound == milliseconds(4096),
+         "publication wait equals the observed recompute time");
+  Expect(PublicationWaitLimit(16384, kPublicationRateMinTokens - 1, 1.0) ==
+                 kPublicationWait &&
+             PublicationWaitLimit(16384, 0, 0.0) == kPublicationWait,
+         "publication wait keeps the fixed cap until a rate is observed");
+  Expect(PublicationWaitLimit(1U << 30, 8192, 2048.0) == kPublicationWait,
+         "publication wait never exceeds the fixed cap");
+
+  Expect(PublicationReleaseFor(0, milliseconds(1), bound) ==
+             PublicationRelease::kPublished,
+         "a published prefix releases the request immediately");
+  Expect(PublicationReleaseFor(16384, bound, bound) ==
+             PublicationRelease::kWaiting,
+         "the request waits up to the computed bound");
+  Expect(PublicationReleaseFor(16384, bound + milliseconds(1), bound) ==
+             PublicationRelease::kBound,
+         "the request is released once the computed bound passes");
+  Expect(PublicationReleaseFor(16384, kPublicationWait, kPublicationWait) ==
+             PublicationRelease::kWaiting,
+         "the fixed cap is inclusive");
+  Expect(PublicationReleaseFor(16384, kPublicationWait + milliseconds(1),
+                               kPublicationWait) == PublicationRelease::kCap,
+         "the request is released at the fixed cap without a rate");
+}
+
 void TestIdlePrefillUsesBulkWorkUnit() {
   auto control = std::make_shared<FakeControl>();
   auto scheduler = MakeScheduler(control, 1, {.decode_active_tokens = 2});
@@ -2931,6 +2967,7 @@ int main() {
   TestSnapshotDoesNotBlockOtherRequests();
   TestFirstTokenPrecedesSnapshotAndPreservesBudget();
   TestIdlePrefillUsesBulkWorkUnit();
+  TestPublicationWaitIsBoundedByRecomputeTime();
   TestConcurrentSharedPrefixesPrefillOnce();
   TestLeaderCancelledBeforeFollowerIsAdmitted();
   TestParkedFollowerSurvivesLeaderCancellation();

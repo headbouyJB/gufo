@@ -2090,11 +2090,12 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
   return Acquire(std::move(prompt), sampling::SamplingConfig{}, is_cancelled);
 }
 
-bool TextRunnerPool::PublicationPending(
+std::size_t TextRunnerPool::PublicationPending(
     std::span<const TextRunnerToken> prompt,
     const TextPromptContext* context) const {
-  return impl_->component_cache &&
-         impl_->component_cache->PublicationPending(prompt, context);
+  return impl_->component_cache
+             ? impl_->component_cache->PublicationPending(prompt, context)
+             : 0;
 }
 
 std::size_t TextRunnerPool::CachedPrefixTokens(
